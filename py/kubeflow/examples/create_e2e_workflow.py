@@ -51,11 +51,13 @@ TEMPLATE_LABEL = "examples_e2e"
 
 MAIN_REPO = "kubeflow/examples"
 
-EXTRA_REPOS = ["kubeflow/testing@HEAD"]
+EXTRA_REPOS = ["kubeflow/testing@HEAD", "kubeflow/tf-operator@HEAD"]
+
+PROW_DICT = argo_build_util.get_prow_dict()
 
 class Builder:
   def __init__(self, name=None, namespace=None, test_target_name=None,
-               bucket=None,
+               bucket=None, cluster_pattern=None,
                **kwargs): # pylint: disable=unused-argument
     """Initialize a builder.
 
@@ -97,6 +99,10 @@ class Builder:
     # py scripts to use.
     self.kubeflow_testing_py = self.src_root_dir + "/kubeflow/testing/py"
 
+    # The directory within the tf-operator submodule containing
+    # py scripts to use.
+    self.kubeflow_tfjob_py = self.src_root_dir + "/kubeflow/tf-operator/py"
+
     # The class name to label junit files.
     # We want to be able to group related tests in test grid.
     # Test grid allows grouping by target which corresponds to the classname
@@ -110,6 +116,7 @@ class Builder:
 
     self.bucket = bucket
     self.workflow = None
+    self.cluster_pattern = cluster_pattern
 
   def _build_workflow(self):
     """Create the scaffolding for the Argo workflow"""
@@ -199,7 +206,7 @@ class Builder:
     common_env = [
         {'name': 'PYTHONPATH',
          'value': ":".join([self.kubeflow_py, self.kubeflow_py + "/py",
-                            self.kubeflow_testing_py,])},
+                            self.kubeflow_testing_py, self.kubeflow_tfjob_py])},
         {'name': 'KUBECONFIG',
          'value': os.path.join(self.test_dir, 'kfctl_test/.kube/kubeconfig')},
     ]
@@ -229,7 +236,7 @@ class Builder:
 
     return None
 
-  def _build_tests_dag(self):
+  def _build_tests_dag_notebooks(self):
     """Build the dag for the set of tests to run against a KF deployment."""
 
     task_template = self._build_task_template()
@@ -240,10 +247,11 @@ class Builder:
     command = ["pytest", "xgboost_test.py",
                # Increase the log level so that info level log statements show up.
                "--log-cli-level=info",
-               "--log-cli-format='%(levelname)s|%(asctime)s|%(pathname)s|%(lineno)d| %(message)'",
+               "--log-cli-format='%(levelname)s|%(asctime)s|%(pathname)s|%(lineno)d| %(message)s'",
                # Test timeout in seconds.
                "--timeout=1800",
                "--junitxml=" + self.artifacts_dir + "/junit_xgboost-synthetic-test.xml",
+               "--notebook_artifacts_dir=" + self.artifacts_dir + "/xgboost-synthetic-test-notebooks",
                ]
 
     dependencies = []
@@ -253,6 +261,23 @@ class Builder:
                                                            "xgboost_synthetic",
                                                            "testing")
 
+    # ***************************************************************************
+    # Test mnist
+    step_name = "mnist"
+    command = ["pytest", "mnist_gcp_test.py",
+               # Increase the log level so that info level log statements show up.
+               "--log-cli-level=info",
+               "--log-cli-format='%(levelname)s|%(asctime)s|%(pathname)s|%(lineno)d| %(message)s'",
+               # Test timeout in seconds.
+               "--timeout=1800",
+               "--junitxml=" + self.artifacts_dir + "/junit_mnist-gcp-test.xml",
+               ]
+
+    dependencies = []
+    mnist_step = self._build_step(step_name, self.workflow, TESTS_DAG_NAME, task_template,
+                                  command, dependencies)
+    mnist_step["container"]["workingDir"] = os.path.join(
+      self.src_dir, "py/kubeflow/examples/notebook_tests")
 
   def _build_exit_dag(self):
     """Build the exit handler dag"""
@@ -324,12 +349,21 @@ class Builder:
     credentials = argo_build_util.deep_copy(task_template)
 
     credentials["name"] = "get-credentials"
-    credentials["container"]["command"] = ["python3",
-                                           "-m",
-                                           "kubeflow.testing."
-                                           "get_kf_testing_cluster",
-                                           "get-credentials",
-                                           ]
+    if self.cluster_pattern:
+      credentials["container"]["command"] = ["python3",
+                                             "-m",
+                                             "kubeflow.testing."
+                                             "get_kf_testing_cluster",
+                                             "--base=" + self.cluster_pattern,
+                                             "get-credentials",
+                                             ]
+    else:
+      credentials["container"]["command"] = ["python3",
+                                             "-m",
+                                             "kubeflow.testing."
+                                             "get_kf_testing_cluster",
+                                             "get-credentials",
+                                             ]
 
     dependencies = [checkout["name"]]
     argo_build_util.add_task_to_dag(self.workflow, E2E_DAG_NAME, credentials,
@@ -337,7 +371,10 @@ class Builder:
 
     #**************************************************************************
     # Run a dag of tests
-    self._build_tests_dag()
+    if self.test_target_name.startswith("notebooks"):
+      self._build_tests_dag_notebooks()
+    else:
+      raise RuntimeError('Invalid test_target_name ' + self.test_target_name)
 
     # Add a task to run the dag
     dependencies = [credentials["name"]]
